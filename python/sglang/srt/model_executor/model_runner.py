@@ -638,9 +638,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # Init routed experts capturer
         self.init_routed_experts_capturer()
 
-        # prealloc before dummy run
-        self.prealloc_symmetric_memory_pool()
-
         if self.device == "cuda" or self.device == "musa":
             self.init_cublas()
             self.init_attention_backend()
@@ -664,6 +661,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         # Initialize piecewise CUDA graph
         self.init_piecewise_cuda_graphs()
+
+        self.prealloc_symmetric_memory_pool()
 
     def init_routed_experts_capturer(self):
         if not self.server_args.disable_shared_experts_fusion and hasattr(
@@ -1964,38 +1963,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         """
         if self.device != "cuda":
             return
-        
-        # Decoupling DeepGEMM warmup and FlashInfer autotune
-        if self._should_run_deepgemm_warmup():
-            self._deepgemm_warmup()
 
         if self._should_run_flashinfer_autotune():
             self._flashinfer_autotune()
-
-    def _should_run_deepgemm_warmup(self) -> bool:
-        """Check if DeepGEMM warmup should be run during init.
-        """
-        try:
-            from sglang.srt.layers.deep_gemm_wrapper.configurer import (
-                ENABLE_JIT_DEEPGEMM,
-            )
-        except ImportError:
-            return False
-        return ENABLE_JIT_DEEPGEMM
-
-    def _deepgemm_warmup(self):
-        """Run a dummy forward pass to trigger DeepGEMM JIT compilation.
-        """
-        logger.info("Running DeepGEMM warmup compilation...")
-
-        # Run on the non-default stream to avoid NCCL issues with symm mem
-        self.forward_stream.wait_stream(torch.cuda.current_stream())
-        with torch.get_device_module(self.device).stream(self.forward_stream):
-            with torch.inference_mode():
-                self._dummy_run(batch_size=self.req_to_token_pool.size)
-        torch.cuda.current_stream().wait_stream(self.forward_stream)
-
-        logger.info("DeepGEMM warmup completed.")
 
     def _should_run_flashinfer_autotune(self) -> bool:
         """Check if flashinfer autotune should be run."""
