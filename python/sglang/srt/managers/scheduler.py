@@ -805,9 +805,10 @@ class Scheduler(
                         f"Connector class {class_name} must inherit from "
                         "sglang.srt.mem_cache.kv_connector.BaseKVConnector"
                     )
-                # Attach DP dimensions so the connector can discover them
+                # Attach DP/PP dimensions so the connector can discover them
                 server_args._dp_size = getattr(self, "dp_size", 1)
                 server_args._dp_rank = getattr(self, "dp_rank", 0)
+                server_args._pp_rank = getattr(self, "pp_rank", 0)
                 connector = connector_cls(
                     params=params,
                     server_args=server_args,
