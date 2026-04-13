@@ -61,7 +61,15 @@ if _is_hip:
             "aiter is AMD specific kernel library. Please make sure aiter is installed on your AMD device."
         )
 else:
-    from sgl_kernel.flash_attn import flash_attn_varlen_func, flash_attn_with_kvcache
+    try:
+        from sgl_kernel.flash_attn import flash_attn_varlen_func, flash_attn_with_kvcache
+        _fa3_import_error = None
+    except ImportError as e:
+        # Blackwell-only sgl-kernel builds may intentionally omit FA3/flash_ops.
+        # NSA backends that use FlashMLA/TRTLLM should still initialize successfully.
+        flash_attn_varlen_func = None
+        flash_attn_with_kvcache = None
+        _fa3_import_error = e
 
 
 # Reuse this workspace buffer across all NSA backend instances
@@ -1624,6 +1632,12 @@ class NativeSparseAttnBackend(
         logit_cap: float,
         page_size: int,
     ) -> torch.Tensor:
+        if flash_attn_with_kvcache is None:
+            raise ImportError(
+                "NSA backend requested FA3, but FA3 kernels are unavailable in "
+                "the installed sgl-kernel."
+            ) from _fa3_import_error
+
         k_rope_cache = kv_cache[:, :, v_head_dim:]
         c_kv_cache = kv_cache[:, :, :v_head_dim]
         qk_rope_dim = k_rope_cache.shape[-1]
@@ -1793,6 +1807,11 @@ class NativeSparseAttnBackend(
             )
 
         # Use FA3 for SM90 (Hopper/H200)
+        if flash_attn_varlen_func is None:
+            raise ImportError(
+                "NSA standard MHA fell back to FA3, but FA3 kernels are unavailable "
+                "in the installed sgl-kernel."
+            ) from _fa3_import_error
         return flash_attn_varlen_func(
             q=q,
             k=k,
