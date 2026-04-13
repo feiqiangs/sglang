@@ -486,6 +486,9 @@ class FlexKVConnector(BaseKVConnector):
                     hit_length, aligned_hit, self.page_size,
                 )
                 hit_length = aligned_hit
+        
+        if update_state_for_load and hit_length <= 0 and self.tp_rank == 0 and flexkv_task_id >= 0:
+            self.kv_manager.cancel([flexkv_task_id])
 
         if update_state_for_load and rid is not None and hit_length > 0:
             self._pending_loads[rid] = flexkv_task_id
