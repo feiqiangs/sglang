@@ -459,12 +459,21 @@ class FlexKVConnector(BaseKVConnector):
 
         if self.tp_rank == 0:
             token_ids_np = np.array(token_ids, dtype=np.int64)
-            flexkv_task_id, matched_mask = self.kv_manager.get_match(
+            result = self.kv_manager.get_match(
                 token_ids=token_ids_np,
                 token_mask=token_mask,
             )
-            hit_length = int(matched_mask.sum()) if matched_mask is not None else 0
-            if not update_state_for_load:
+            # get_match returns None when the FlexKV server encounters an
+            # error (e.g. in server_client_mode).  Guard against unpacking a
+            # None result to avoid crashing the scheduler.
+            if result is None:
+                logger.warning("[FlexKV] get_match returned None, treating as no hit")
+                flexkv_task_id = -1
+                hit_length = 0
+            else:
+                flexkv_task_id, matched_mask = result
+                hit_length = int(matched_mask.sum()) if matched_mask is not None else 0
+            if not update_state_for_load and flexkv_task_id >= 0:
                 self.kv_manager.cancel([flexkv_task_id])
 
         if self.tp_cpu_group is not None and self.tp_size > 1:
@@ -492,10 +501,16 @@ class FlexKVConnector(BaseKVConnector):
 
         if update_state_for_load and rid is not None and hit_length > 0:
             self._pending_loads[rid] = flexkv_task_id
+        elif update_state_for_load and flexkv_task_id >= 0 and self.tp_rank == 0:
+            # Task was not cancelled earlier, but won't be used — cancel it now
+            # to avoid resource leak (e.g. hit_length page-aligned to 0, or rid is None)
+            self.kv_manager.cancel([flexkv_task_id])
         return hit_length
 
     def release_load_state(self, rid: str) -> None:
-        self._pending_loads.pop(rid, None)
+        fkv_tid = self._pending_loads.pop(rid, -1)
+        if fkv_tid >= 0 and self.tp_rank == 0:
+            self.kv_manager.cancel([fkv_tid])
 
     def start_load_kv(
         self,
@@ -563,10 +578,11 @@ class FlexKVConnector(BaseKVConnector):
             self.kv_manager.try_wait(task_ids=self._load_fkv_tids)
             self._load_fkv_tids.clear()
 
-        for ext_tid, producer_id in list(self._ongoing_loads.items()):
-            if self._layer_done_counter.events[producer_id]._finished:
-                self._completed_loads.append(ext_tid)
-                del self._ongoing_loads[ext_tid]
+        if self._layer_done_counter is not None:
+            for ext_tid, producer_id in list(self._ongoing_loads.items()):
+                if self._layer_done_counter.events[producer_id]._finished:
+                    self._completed_loads.append(ext_tid)
+                    del self._ongoing_loads[ext_tid]
 
         result = list(self._completed_loads)
         self._completed_loads.clear()
@@ -602,9 +618,16 @@ class FlexKVConnector(BaseKVConnector):
                     token_ids_np = token_ids_np[:aligned_len]
                     kv_indices = kv_indices[:aligned_len]
 
-            fkv_task_id, unmatched_mask = self.kv_manager.put_match(
+            result = self.kv_manager.put_match(
                 token_ids=token_ids_np, token_mask=None
             )
+            # put_match returns None when the FlexKV server encounters an
+            # error (e.g. in server_client_mode).  Treat as a failed store.
+            if result is None:
+                logger.warning("[FlexKV] put_match returned None, skipping store for task %d", task_id)
+                self._completed_stores.append(task_id)
+                return
+            fkv_task_id, unmatched_mask = result
 
             if unmatched_mask.sum() > 0:
                 filtered = kv_indices[unmatched_mask]
@@ -646,7 +669,9 @@ class FlexKVConnector(BaseKVConnector):
     # ---- Optional overrides ----
 
     def cancel_prefetch(self, rid: str) -> None:
-        self._pending_loads.pop(rid, None)
+        fkv_tid = self._pending_loads.pop(rid, -1)
+        if fkv_tid >= 0 and self.tp_rank == 0:
+            self.kv_manager.cancel([fkv_tid])
 
     @property
     def layer_done_counter(self) -> Any:
@@ -657,6 +682,10 @@ class FlexKVConnector(BaseKVConnector):
             kvcache.register_layer_transfer_counter(self._layer_done_counter)
 
     def reset(self) -> None:
+        if self.tp_rank == 0 and self._pending_loads:
+            pending_tids = [tid for tid in self._pending_loads.values() if tid >= 0]
+            if pending_tids:
+                self.kv_manager.cancel(pending_tids)
         self._pending_loads.clear()
         self._ongoing_loads.clear()
         self._completed_loads.clear()
@@ -740,6 +769,12 @@ class FlexKVConnector(BaseKVConnector):
                 f"Expected 2D indexer tensor (num_pages, page_stride_size), "
                 f"got shape={indexer_tensor.shape}"
             )
+            # sglang's NSA indexer buffer is 2D: (num_pages, page_stride_size),
+            # where page_stride_size = page_size * (index_head_dim + scale_bytes).
+            # All tokens within a page are flattened into a single contiguous
+            # vector, so from FlexKV's perspective each page is one indivisible
+            # block with tokens_per_block=1.  The resulting block_stride
+            # (= 1 * 1 * page_stride_size) correctly addresses each page.
             indexer_layout = KVCacheLayout(
                 type=KVCacheLayoutType.LAYERFIRST,
                 num_layer=len(indexer_buffers),
