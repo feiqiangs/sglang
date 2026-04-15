@@ -14,6 +14,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
 )
 from sglang.srt.mem_cache.kv_connector import BaseKVConnector, LoadOperation
 from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey, TreeNode, page_align_keys
+from sglang.srt.mem_cache.utils import convert_to_bigram_key
 from sglang.srt.mem_cache.base_prefix_cache import InitLoadBackParams
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
@@ -222,28 +223,80 @@ class ExtendedRadixCache(BasePrefixCache):
         if self._connector is None or not is_insert:
             return
 
-        req_id = req.req_pool_idx
-        token_ids = (req.origin_input_ids + req.output_ids)[:kv_committed_len]
-        # Reuse sglang's page_align_keys to truncate to page boundary
-        token_ids = page_align_keys(token_ids, self.page_size)
-        if len(token_ids) == 0:
+        if req.req_pool_idx is None and not is_insert:
             return
-        kv_indices = self._inner_radixtree.req_to_token_pool.req_to_token[
-            req_id, : len(token_ids)
-        ]
+
+        # Build the radix key exactly the same way the base class did during
+        # insert() so that match_prefix finds the same path.
+        all_token_ids = (req.origin_input_ids + req.output_ids)[:kv_committed_len]
+        keys = convert_to_bigram_key(all_token_ids) if self._inner_radixtree.is_eagle else all_token_ids
+        keys = page_align_keys(keys, self.page_size)
+        if len(keys) == 0:
+            return
+
+        radix_key = RadixKey(keys, req.extra_key, is_bigram=self._inner_radixtree.is_eagle)
+
+        # After inner_radixtree.cache_finished_req(), req.last_node still points
+        # to the node from the *previous* match_prefix (before insert).  The base
+        # class does NOT update req.last_node in cache_finished_req (unlike
+        # cache_unfinished_req which re-matches).  We must re-match to find the
+        # actual leaf node that now holds the full page-aligned kv_indices.
+        match_result = self._inner_radixtree.match_prefix(MatchPrefixParams(key=radix_key))
+        new_last_node = match_result.last_device_node
+        if new_last_node is None or new_last_node is self._inner_radixtree.root_node:
+            return
+
+        # Use the kv_indices directly from match_prefix result.
+        # match_prefix walks the tree top-down and collects node.value along
+        # the matched path, so device_indices is already the concatenation of
+        # all matched nodes' values — exactly what we need for D2H transfer.
+        kv_indices = match_result.device_indices
+        if kv_indices is None or kv_indices.numel() == 0:
+            return
+
+        # token_ids for the store operation: use the page-aligned keys we
+        # already built (same source of truth as the base-class insert).
+        # For EAGLE bigram keys, flatten back to the original token_ids that
+        # the connector expects.
+        if self._inner_radixtree.is_eagle:
+            # bigram keys are tuples; flatten them for the connector
+            token_ids = []
+            for k in keys:
+                if isinstance(k, tuple):
+                    token_ids.extend(k)
+                else:
+                    token_ids.append(k)
+        else:
+            token_ids = list(keys) if not isinstance(keys, list) else keys
+
+        # Sanity check: token_ids and kv_indices must have the same length.
+        # If they don't, log a warning and skip to avoid corrupting storage.
+        if len(token_ids) != kv_indices.numel():
+            logger.warning(
+                "[FlexKV] cache_finished_req: length mismatch! "
+                "len(token_ids)=%d, kv_indices.numel()=%d, "
+                "req_pool_idx=%d, kv_committed_len=%d, page_size=%d, "
+                "len(keys)=%d, match_device_indices_len=%d",
+                len(token_ids), kv_indices.numel(),
+                req.req_pool_idx, kv_committed_len, self.page_size,
+                len(keys), match_result.device_indices.numel(),
+            )
+            return
+
+        # Path C fix: lock the tree node BEFORE starting async D2H transfer
+        # so that evict cannot free these pages while transfer is in flight.
+        self._inner_radixtree.inc_lock_ref(new_last_node)
 
         task_id = self._load_task_id_counter
         self._load_task_id_counter += 1
 
-        self._inner_radixtree.inc_lock_ref(req.last_node)
-        
         self._connector.start_store_kv(
             task_id=task_id,
             token_ids=token_ids,
             kv_indices=kv_indices,
         )
 
-        self._ongoing_store_tasks[task_id] = req.last_node
+        self._ongoing_store_tasks[task_id] = new_last_node
 
     def evict(self, params: EvictParams) -> EvictResult:
         return self._inner_radixtree.evict(params)

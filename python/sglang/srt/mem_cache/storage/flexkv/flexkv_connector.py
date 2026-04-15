@@ -483,12 +483,21 @@ class FlexKVConnector(BaseKVConnector):
         #       TP/CP group's behalf and broadcast the result to the rest of the group.
         if self.rank == 0:
             token_ids_np = np.array(token_ids, dtype=np.int64)
-            flexkv_task_id, matched_mask = self.kv_manager.get_match(
+            result = self.kv_manager.get_match(
                 token_ids=token_ids_np,
                 token_mask=token_mask,
             )
-            hit_length = int(matched_mask.sum()) if matched_mask is not None else 0
-            if not update_state_for_load:
+            # get_match returns None when the FlexKV server encounters an
+            # error (e.g. in server_client_mode).  Guard against unpacking a
+            # None result to avoid crashing the scheduler.
+            if result is None:
+                logger.warning("[FlexKV] get_match returned None, treating as no hit")
+                flexkv_task_id = -1
+                hit_length = 0
+            else:
+                flexkv_task_id, matched_mask = result
+                hit_length = int(matched_mask.sum()) if matched_mask is not None else 0
+            if not update_state_for_load and flexkv_task_id >= 0:
                 self.kv_manager.cancel([flexkv_task_id])
 
         if self.cp_cpu_group is not None and self.cp_size > 1:
@@ -519,13 +528,22 @@ class FlexKVConnector(BaseKVConnector):
                     hit_length, aligned_hit, self.page_size,
                 )
                 hit_length = aligned_hit
+        
+        if update_state_for_load and hit_length <= 0 and self.tp_rank == 0 and flexkv_task_id >= 0:
+            self.kv_manager.cancel([flexkv_task_id])
 
         if update_state_for_load and rid is not None and hit_length > 0:
             self._pending_loads[rid] = flexkv_task_id
+        elif update_state_for_load and flexkv_task_id >= 0 and self.tp_rank == 0:
+            # Task was not cancelled earlier, but won't be used — cancel it now
+            # to avoid resource leak (e.g. hit_length page-aligned to 0, or rid is None)
+            self.kv_manager.cancel([flexkv_task_id])
         return hit_length
 
     def release_load_state(self, rid: str) -> None:
-        self._pending_loads.pop(rid, None)
+        fkv_tid = self._pending_loads.pop(rid, -1)
+        if fkv_tid >= 0 and self.tp_rank == 0:
+            self.kv_manager.cancel([fkv_tid])
 
     def start_load_kv(
         self,
@@ -595,10 +613,11 @@ class FlexKVConnector(BaseKVConnector):
             self.kv_manager.try_wait(task_ids=self._load_fkv_tids)
             self._load_fkv_tids.clear()
 
-        for ext_tid, producer_id in list(self._ongoing_loads.items()):
-            if self._layer_done_counter.events[producer_id]._finished:
-                self._completed_loads.append(ext_tid)
-                del self._ongoing_loads[ext_tid]
+        if self._layer_done_counter is not None:
+            for ext_tid, producer_id in list(self._ongoing_loads.items()):
+                if self._layer_done_counter.events[producer_id]._finished:
+                    self._completed_loads.append(ext_tid)
+                    del self._ongoing_loads[ext_tid]
 
         result = list(self._completed_loads)
         self._completed_loads.clear()
@@ -634,9 +653,16 @@ class FlexKVConnector(BaseKVConnector):
                     token_ids_np = token_ids_np[:aligned_len]
                     kv_indices = kv_indices[:aligned_len]
 
-            fkv_task_id, unmatched_mask = self.kv_manager.put_match(
+            result = self.kv_manager.put_match(
                 token_ids=token_ids_np, token_mask=None
             )
+            # put_match returns None when the FlexKV server encounters an
+            # error (e.g. in server_client_mode).  Treat as a failed store.
+            if result is None:
+                logger.warning("[FlexKV] put_match returned None, skipping store for task %d", task_id)
+                self._completed_stores.append(task_id)
+                return
+            fkv_task_id, unmatched_mask = result
 
             if unmatched_mask.sum() > 0:
                 filtered = kv_indices[unmatched_mask]
@@ -685,7 +711,9 @@ class FlexKVConnector(BaseKVConnector):
     # ---- Optional overrides ----
 
     def cancel_prefetch(self, rid: str) -> None:
-        self._pending_loads.pop(rid, None)
+        fkv_tid = self._pending_loads.pop(rid, -1)
+        if fkv_tid >= 0 and self.tp_rank == 0:
+            self.kv_manager.cancel([fkv_tid])
 
     @property
     def layer_done_counter(self) -> Any:
@@ -696,6 +724,10 @@ class FlexKVConnector(BaseKVConnector):
             kvcache.register_layer_transfer_counter(self._layer_done_counter)
 
     def reset(self) -> None:
+        if self.tp_rank == 0 and self._pending_loads:
+            pending_tids = [tid for tid in self._pending_loads.values() if tid >= 0]
+            if pending_tids:
+                self.kv_manager.cancel(pending_tids)
         self._pending_loads.clear()
         self._ongoing_loads.clear()
         self._completed_loads.clear()
@@ -779,6 +811,12 @@ class FlexKVConnector(BaseKVConnector):
                 f"Expected 2D indexer tensor (num_pages, page_stride_size), "
                 f"got shape={indexer_tensor.shape}"
             )
+            # sglang's NSA indexer buffer is 2D: (num_pages, page_stride_size),
+            # where page_stride_size = page_size * (index_head_dim + scale_bytes).
+            # All tokens within a page are flattened into a single contiguous
+            # vector, so from FlexKV's perspective each page is one indivisible
+            # block with tokens_per_block=1.  The resulting block_stride
+            # (= 1 * 1 * page_stride_size) correctly addresses each page.
             indexer_layout = KVCacheLayout(
                 type=KVCacheLayoutType.LAYERFIRST,
                 num_layer=len(indexer_buffers),
@@ -829,14 +867,48 @@ class FlexKVConnector(BaseKVConnector):
         self, retry_interval: float = 1.0
     ):
         max_retries = self.layerwise_eventfd_connect_max_retries
+        # Allow up to 3 full connect+send attempts before giving up.
+        max_send_retries = 3
         logger.info(
             f"[FlexKV] Attempting eventfd connection{self._rank_label}: "
             f"socket={self.layerwise_eventfd_socket}, max_retries={max_retries}")
 
-        # Retry until worker is ready.
-        sock = None
-        for attempt in range(max_retries):
-            sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        last_error = None
+        for send_attempt in range(max_send_retries):
+            # Phase 1: Connect to the worker socket (retry until ready).
+            sock = None
+            for attempt in range(max_retries):
+                sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                try:
+                    sock.connect(self.layerwise_eventfd_socket)
+                    logger.info(
+                        f"[FlexKV] Eventfd connected{self._rank_label}: "
+                        f"socket={self.layerwise_eventfd_socket}, "
+                        f"attempts={attempt + 1}"
+                        f"{f', send_retry={send_attempt}' if send_attempt > 0 else ''}")
+                    break
+                except (FileNotFoundError, ConnectionRefusedError) as e:
+                    sock.close()
+                    sock = None
+                    if attempt == max_retries - 1:
+                        logger.error(
+                            f"[FlexKV] Eventfd connection failed{self._rank_label}: "
+                            f"socket={self.layerwise_eventfd_socket}, "
+                            f"attempts={max_retries}, error={type(e).__name__}")
+                        raise RuntimeError(
+                            f"[FlexKV] Failed to connect to eventfd socket "
+                            f"{self.layerwise_eventfd_socket} after {max_retries} attempts"
+                        )
+                    if attempt % 10 == 0:
+                        socket_exists = os.path.exists(self.layerwise_eventfd_socket)
+                        logger.debug(
+                            f"[FlexKV] Eventfd connect retry{self._rank_label}: "
+                            f"socket={self.layerwise_eventfd_socket}, "
+                            f"attempt={attempt + 1}/{max_retries}, "
+                            f"error={type(e).__name__}, socket_exists={socket_exists}")
+                    time.sleep(retry_interval)
+
+            # Phase 2: Send metadata + eventfds over the connected socket.
             try:
                 sock.connect(self.layerwise_eventfd_socket)
                 logger.info(
@@ -880,23 +952,56 @@ class FlexKVConnector(BaseKVConnector):
                 fds = self._layer_done_counter.events[counter_id].load_event_fds
                 send_fds(sock, fds, struct.pack("i", counter_id))
                 logger.debug(
-                    f"[FlexKV] Eventfd fds sent{self._rank_label}: "
-                    f"counter_id={counter_id}, num_fds={len(fds)}")
+                    f"[FlexKV] Eventfd metadata sent{self._rank_label}: "
+                    f"tp_rank={self.tp_rank}, tp_size={self.tp_size}, "
+                    f"num_layers={self.num_layers}, num_counters={num_counters}")
 
-            self._worker_connected = True
-            logger.info(
-                f"[FlexKV] Eventfd setup complete{self._rank_label}: "
-                f"socket={self.layerwise_eventfd_socket}, "
-                f"counters={num_counters}, layers={self.num_layers}")
+                for counter_id in range(num_counters):
+                    fds = self._layer_done_counter.events[counter_id].load_event_fds
+                    send_fds(sock, fds, struct.pack("i", counter_id))
+                    logger.debug(
+                        f"[FlexKV] Eventfd fds sent{self._rank_label}: "
+                        f"counter_id={counter_id}, num_fds={len(fds)}")
 
-        except Exception as e:
-            logger.error(
-                f"[FlexKV] Failed to send eventfds{self._rank_label}: "
-                f"socket={self.layerwise_eventfd_socket}, error={e}",
-                exc_info=True)
-            raise RuntimeError(
-                f"[FlexKV] Failed to send eventfds to {self.layerwise_eventfd_socket}: {e}"
-            )
-        finally:
-            if sock is not None:
-                sock.close()
+                # Wait for ACK from server to confirm fds were received
+                sock.settimeout(30.0)
+                try:
+                    ack = sock.recv(1)
+                except socket.timeout:
+                    raise RuntimeError("Timed out waiting for ACK from FlexKV worker")
+                if not ack or ack[0] != 1:
+                    raise RuntimeError(
+                        f"FlexKV worker NACK'd eventfd transfer (ack={ack!r})")
+
+                self._worker_connected = True
+                logger.info(
+                    f"[FlexKV] Eventfd setup complete{self._rank_label}: "
+                    f"socket={self.layerwise_eventfd_socket}, "
+                    f"counters={num_counters}, layers={self.num_layers}")
+                return  # Success
+
+            except Exception as e:
+                last_error = e
+                logger.warning(
+                    f"[FlexKV] Failed to send eventfds{self._rank_label} "
+                    f"(send_attempt {send_attempt + 1}/{max_send_retries}): "
+                    f"socket={self.layerwise_eventfd_socket}, error={e}. "
+                    f"Will reconnect and retry...")
+            finally:
+                if sock is not None:
+                    sock.close()
+                    sock = None
+
+            # Brief pause before reconnecting
+            time.sleep(retry_interval)
+
+        # All send retries exhausted
+        logger.error(
+            f"[FlexKV] Failed to send eventfds{self._rank_label} after "
+            f"{max_send_retries} attempts: "
+            f"socket={self.layerwise_eventfd_socket}, last_error={last_error}",
+            exc_info=True)
+        raise RuntimeError(
+            f"[FlexKV] Failed to send eventfds to {self.layerwise_eventfd_socket} "
+            f"after {max_send_retries} attempts: {last_error}"
+        )
