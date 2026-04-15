@@ -885,6 +885,16 @@ class FlexKVConnector(BaseKVConnector):
                         f"[FlexKV] Eventfd fds sent{self._rank_label}: "
                         f"counter_id={counter_id}, num_fds={len(fds)}")
 
+                # Wait for ACK from server to confirm fds were received
+                sock.settimeout(30.0)
+                try:
+                    ack = sock.recv(1)
+                except socket.timeout:
+                    raise RuntimeError("Timed out waiting for ACK from FlexKV worker")
+                if not ack or ack[0] != 1:
+                    raise RuntimeError(
+                        f"FlexKV worker NACK'd eventfd transfer (ack={ack!r})")
+
                 self._worker_connected = True
                 logger.info(
                     f"[FlexKV] Eventfd setup complete{self._rank_label}: "
