@@ -979,17 +979,17 @@ class FlexKVConnector(BaseKVConnector):
                     f"counters={num_counters}, layers={self.num_layers}")
                 return  # Success
 
-            except Exception as e:
-                last_error = e
-                logger.warning(
-                    f"[FlexKV] Failed to send eventfds{self._rank_label} "
-                    f"(send_attempt {send_attempt + 1}/{max_send_retries}): "
-                    f"socket={self.layerwise_eventfd_socket}, error={e}. "
-                    f"Will reconnect and retry...")
-            finally:
-                if sock is not None:
-                    sock.close()
-                    sock = None
+        except Exception as e:
+            last_error = e
+            logger.warning(
+                f"[FlexKV] Failed to send eventfds{self._rank_label} "
+                f"(send_attempt {send_attempt + 1}/{max_send_retries}): "
+                f"socket={self.layerwise_eventfd_socket}, error={e}. "
+                f"Will reconnect and retry...")
+        finally:
+            if sock is not None:
+                sock.close()
+                sock = None
 
             # Brief pause before reconnecting
             time.sleep(retry_interval)
