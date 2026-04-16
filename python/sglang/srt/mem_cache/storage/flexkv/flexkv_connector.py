@@ -874,95 +874,77 @@ class FlexKVConnector(BaseKVConnector):
 
         last_error = None
         for send_attempt in range(max_send_retries):
-            # Phase 1: Connect to the worker socket (retry until ready).
             sock = None
-            for attempt in range(max_retries):
-                sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-                try:
-                    sock.connect(self.layerwise_eventfd_socket)
-                    logger.info(
-                        f"[FlexKV] Eventfd connected{self._rank_label}: "
-                        f"socket={self.layerwise_eventfd_socket}, "
-                        f"attempts={attempt + 1}"
-                        f"{f', send_retry={send_attempt}' if send_attempt > 0 else ''}")
-                    break
-                except (FileNotFoundError, ConnectionRefusedError) as e:
-                    sock.close()
-                    sock = None
-                    if attempt == max_retries - 1:
-                        logger.error(
-                            f"[FlexKV] Eventfd connection failed{self._rank_label}: "
-                            f"socket={self.layerwise_eventfd_socket}, "
-                            f"attempts={max_retries}, error={type(e).__name__}")
-                        raise RuntimeError(
-                            f"[FlexKV] Failed to connect to eventfd socket "
-                            f"{self.layerwise_eventfd_socket} after {max_retries} attempts"
-                        )
-                    if attempt % 10 == 0:
-                        socket_exists = os.path.exists(self.layerwise_eventfd_socket)
-                        logger.debug(
-                            f"[FlexKV] Eventfd connect retry{self._rank_label}: "
-                            f"socket={self.layerwise_eventfd_socket}, "
-                            f"attempt={attempt + 1}/{max_retries}, "
-                            f"error={type(e).__name__}, socket_exists={socket_exists}")
-                    time.sleep(retry_interval)
-
-            # Phase 2: Send metadata + eventfds over the connected socket.
             try:
-                sock.connect(self.layerwise_eventfd_socket)
-                logger.info(
-                    f"[FlexKV] Eventfd connected{self._rank_label}: "
-                    f"socket={self.layerwise_eventfd_socket}, "
-                    f"attempts={attempt + 1}")
-                break
-            except (FileNotFoundError, ConnectionRefusedError) as e:
-                sock.close()
-                sock = None
-                if attempt == max_retries - 1:
-                    logger.error(
-                        f"[FlexKV] Eventfd connection failed{self._rank_label}: "
-                        f"socket={self.layerwise_eventfd_socket}, "
-                        f"attempts={max_retries}, error={type(e).__name__}")
+                # Phase 1: Connect to the worker socket (retry until ready).
+                for attempt in range(max_retries):
+                    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                    try:
+                        sock.connect(self.layerwise_eventfd_socket)
+                        logger.info(
+                            f"[FlexKV] Eventfd connected{self._rank_label}: "
+                            f"socket={self.layerwise_eventfd_socket}, "
+                            f"attempts={attempt + 1}"
+                            f"{f', send_retry={send_attempt}' if send_attempt > 0 else ''}"
+                        )
+                        break
+                    except (FileNotFoundError, ConnectionRefusedError) as e:
+                        sock.close()
+                        sock = None
+                        if attempt == max_retries - 1:
+                            logger.error(
+                                f"[FlexKV] Eventfd connection failed{self._rank_label}: "
+                                f"socket={self.layerwise_eventfd_socket}, "
+                                f"attempts={max_retries}, error={type(e).__name__}"
+                            )
+                            raise RuntimeError(
+                                f"[FlexKV] Failed to connect to eventfd socket "
+                                f"{self.layerwise_eventfd_socket} after {max_retries} attempts"
+                            )
+                        if attempt % 10 == 0:
+                            socket_exists = os.path.exists(self.layerwise_eventfd_socket)
+                            logger.debug(
+                                f"[FlexKV] Eventfd connect retry{self._rank_label}: "
+                                f"socket={self.layerwise_eventfd_socket}, "
+                                f"attempt={attempt + 1}/{max_retries}, "
+                                f"error={type(e).__name__}, socket_exists={socket_exists}"
+                            )
+                        time.sleep(retry_interval)
+
+                if sock is None:
                     raise RuntimeError(
-                        f"[FlexKV] Failed to connect to eventfd socket "
-                        f"{self.layerwise_eventfd_socket} after {max_retries} attempts"
+                        f"[FlexKV] Eventfd socket unavailable after {max_retries} attempts: "
+                        f"{self.layerwise_eventfd_socket}"
                     )
-                if attempt % 10 == 0:
-                    socket_exists = os.path.exists(self.layerwise_eventfd_socket)
-                    logger.debug(
-                        f"[FlexKV] Eventfd connect retry{self._rank_label}: "
-                        f"socket={self.layerwise_eventfd_socket}, "
-                        f"attempt={attempt + 1}/{max_retries}, "
-                        f"error={type(e).__name__}, socket_exists={socket_exists}")
-                time.sleep(retry_interval)
 
-        try:
-            num_counters = self._layer_done_counter.num_counters
-            metadata = struct.pack(
-                "iiiiii", self.tp_rank, self.tp_size, self.cp_rank, self.cp_size, self.num_layers, num_counters
-            )
-            sock.sendall(metadata)
-            logger.debug(
-                f"[FlexKV] Eventfd metadata sent{self._rank_label}: "
-                f"tp_rank={self.tp_rank}, tp_size={self.tp_size}, cp_rank={self.cp_rank}, cp_size={self.cp_size}, "
-                f"num_layers={self.num_layers}, num_counters={num_counters}")
-
-            for counter_id in range(num_counters):
-                fds = self._layer_done_counter.events[counter_id].load_event_fds
-                send_fds(sock, fds, struct.pack("i", counter_id))
+                # Phase 2: Send metadata + eventfds over the connected socket.
+                num_counters = self._layer_done_counter.num_counters
+                metadata = struct.pack(
+                    "iiiiii",
+                    self.tp_rank,
+                    self.tp_size,
+                    self.cp_rank,
+                    self.cp_size,
+                    self.num_layers,
+                    num_counters,
+                )
+                sock.sendall(metadata)
                 logger.debug(
                     f"[FlexKV] Eventfd metadata sent{self._rank_label}: "
                     f"tp_rank={self.tp_rank}, tp_size={self.tp_size}, "
-                    f"num_layers={self.num_layers}, num_counters={num_counters}")
+                    f"cp_rank={self.cp_rank}, cp_size={self.cp_size}, "
+                    f"num_layers={self.num_layers}, num_counters={num_counters}"
+                )
 
                 for counter_id in range(num_counters):
                     fds = self._layer_done_counter.events[counter_id].load_event_fds
                     send_fds(sock, fds, struct.pack("i", counter_id))
                     logger.debug(
                         f"[FlexKV] Eventfd fds sent{self._rank_label}: "
-                        f"counter_id={counter_id}, num_fds={len(fds)}")
+                        f"counter_id={counter_id}, num_fds={len(fds)}"
+                    )
 
-                # Wait for ACK from server to confirm fds were received
+                # Wait for ACK from server to confirm fds were received.
                 sock.settimeout(30.0)
                 try:
                     ack = sock.recv(1)
@@ -970,36 +952,37 @@ class FlexKVConnector(BaseKVConnector):
                     raise RuntimeError("Timed out waiting for ACK from FlexKV worker")
                 if not ack or ack[0] != 1:
                     raise RuntimeError(
-                        f"FlexKV worker NACK'd eventfd transfer (ack={ack!r})")
+                        f"FlexKV worker NACK'd eventfd transfer (ack={ack!r})"
+                    )
 
                 self._worker_connected = True
                 logger.info(
                     f"[FlexKV] Eventfd setup complete{self._rank_label}: "
                     f"socket={self.layerwise_eventfd_socket}, "
-                    f"counters={num_counters}, layers={self.num_layers}")
-                return  # Success
+                    f"counters={num_counters}, layers={self.num_layers}"
+                )
+                return
+            except Exception as e:
+                last_error = e
+                logger.warning(
+                    f"[FlexKV] Failed to send eventfds{self._rank_label} "
+                    f"(send_attempt {send_attempt + 1}/{max_send_retries}): "
+                    f"socket={self.layerwise_eventfd_socket}, error={e}. "
+                    f"Will reconnect and retry..."
+                )
+            finally:
+                if sock is not None:
+                    sock.close()
+                # Brief pause before reconnecting.
+                time.sleep(retry_interval)
 
-        except Exception as e:
-            last_error = e
-            logger.warning(
-                f"[FlexKV] Failed to send eventfds{self._rank_label} "
-                f"(send_attempt {send_attempt + 1}/{max_send_retries}): "
-                f"socket={self.layerwise_eventfd_socket}, error={e}. "
-                f"Will reconnect and retry...")
-        finally:
-            if sock is not None:
-                sock.close()
-                sock = None
-
-            # Brief pause before reconnecting
-            time.sleep(retry_interval)
-
-        # All send retries exhausted
+        # All send retries exhausted.
         logger.error(
             f"[FlexKV] Failed to send eventfds{self._rank_label} after "
             f"{max_send_retries} attempts: "
             f"socket={self.layerwise_eventfd_socket}, last_error={last_error}",
-            exc_info=True)
+            exc_info=True,
+        )
         raise RuntimeError(
             f"[FlexKV] Failed to send eventfds to {self.layerwise_eventfd_socket} "
             f"after {max_send_retries} attempts: {last_error}"
