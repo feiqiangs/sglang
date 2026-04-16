@@ -140,21 +140,17 @@ class FlexKVLayerLoadingEvent:
             eventfd(0, EFD_SEMAPHORE) for _ in range(num_layers)
         ]
         self._finished = True
-        self._last_layer_wait_count = 0
-        self.wait_remaining: List[int] = [2] * num_layers
+        self.wait_remaining: List[int] = [1] * num_layers
 
     def reset_for_new_transfer(self):
         self._finished = False
-        self._last_layer_wait_count = 0
-        self.wait_remaining = [2] * self._num_layers
+        self.wait_remaining = [1] * self._num_layers
 
     def wait(self, layer_index: int):
         assert 0 <= layer_index < self._num_layers
         eventfd_read(self.load_event_fds[layer_index])
         if layer_index == self._num_layers - 1:
-            self._last_layer_wait_count += 1
-            if self._last_layer_wait_count >= 2:
-                self._finished = True
+            self._finished = True
 
     def close(self):
         for fd in self.load_event_fds:
@@ -208,7 +204,7 @@ class FlexKVLayerDoneCounter:
         if producer_id is not None:
             self.consumer_index = producer_id
         else:
-            self.consumer_index = index
+            self.consumer_index = -1
 
     def wait_until(self, threshold: int):
         if self.consumer_index < 0:
@@ -282,9 +278,9 @@ class FlexKVConnector(BaseKVConnector):
             pp_rank=pp_rank,
             dp_size=dp_size,
             dp_rank=dp_rank,
+            is_nsa_cp=server_args.enable_nsa_prefill_context_parallel,
             cp_size=cp_size,
             cp_rank=cp_rank,
-            nsa_prefill_cp=server_args.enable_nsa_prefill_context_parallel
         )
 
         self.tp_size = server_args.tp_size
@@ -499,6 +495,10 @@ class FlexKVConnector(BaseKVConnector):
                 hit_length = int(matched_mask.sum()) if matched_mask is not None else 0
             if not update_state_for_load and flexkv_task_id >= 0:
                 self.kv_manager.cancel([flexkv_task_id])
+            else:
+                ## GPU hit length is the zero length of token masks
+                gpu_hit_length = torch.logical_not(token_mask).sum()
+                logger.info(f"[FlexKV Connector] gpu hit length: {gpu_hit_length}, Flexkv hit length: {hit_length}")
 
         if self.cp_cpu_group is not None and self.cp_size > 1:
             data = broadcast_pyobj(
@@ -663,6 +663,8 @@ class FlexKVConnector(BaseKVConnector):
                 self._completed_stores.append(task_id)
                 return
             fkv_task_id, unmatched_mask = result
+
+            logger.info(f"[FlexKV] start_store_kv: token_ids length: {len(token_ids)}, kv_indices length: {len(kv_indices)}, fkv_task_id: {fkv_task_id}, unmatched_mask: {unmatched_mask}")
 
             if unmatched_mask.sum() > 0:
                 filtered = kv_indices[unmatched_mask]
