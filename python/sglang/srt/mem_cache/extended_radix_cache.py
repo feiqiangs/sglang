@@ -217,25 +217,34 @@ class ExtendedRadixCache(BasePrefixCache):
         # sets kv_committed_freed=True and cannot be called again).
         kv_committed_len = req.kv_committed_len
 
+        token_ids = None
+        kv_indices = None
+        if self._connector is not None and is_insert:
+            req_id = req.req_pool_idx
+            token_ids = (req.origin_input_ids + req.output_ids)[:kv_committed_len]
+            # Reuse sglang's page_align_keys to truncate to page boundary
+            token_ids = page_align_keys(token_ids, self.page_size)
+            if len(token_ids) > 0 and req_id is not None:
+                # Snapshot kv_indices before inner cache_finished_req potentially frees them.
+                kv_indices = self._inner_radixtree.req_to_token_pool.req_to_token[
+                    req_id, : len(token_ids)
+                ].to(dtype=torch.int64, copy=True)
+
+        cache_to_connector = False
+        if self._connector is not None and is_insert and \
+            token_ids is not None and len(token_ids) > 0 and kv_indices is not None:
+            cache_to_connector = True
+        
+        if cache_to_connector:
+            self._inner_radixtree.inc_lock_ref(req.last_node)
+
         self._inner_radixtree.cache_finished_req(req, is_insert=is_insert, **kwargs)
 
-        if self._connector is None or not is_insert:
+        if not cache_to_connector:
             return
-
-        req_id = req.req_pool_idx
-        token_ids = (req.origin_input_ids + req.output_ids)[:kv_committed_len]
-        # Reuse sglang's page_align_keys to truncate to page boundary
-        token_ids = page_align_keys(token_ids, self.page_size)
-        if len(token_ids) == 0:
-            return
-        kv_indices = self._inner_radixtree.req_to_token_pool.req_to_token[
-            req_id, : len(token_ids)
-        ]
 
         task_id = self._load_task_id_counter
         self._load_task_id_counter += 1
-
-        self._inner_radixtree.inc_lock_ref(req.last_node)
         
         self._connector.start_store_kv(
             task_id=task_id,
