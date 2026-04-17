@@ -281,6 +281,7 @@ class FlexKVConnector(BaseKVConnector):
             is_nsa_cp=server_args.enable_nsa_prefill_context_parallel,
             cp_size=cp_size,
             cp_rank=cp_rank,
+            kv_cache_dtype=getattr(server_args, "kv_cache_dtype", None),
         )
 
         self.tp_size = server_args.tp_size
@@ -548,7 +549,13 @@ class FlexKVConnector(BaseKVConnector):
                 flexkv_task_id, matched_mask = result
                 hit_length = int(matched_mask.sum()) if matched_mask is not None else 0
             if not update_state_for_load and flexkv_task_id >= 0:
-                self.kv_manager.cancel([flexkv_task_id])
+                # Only cancel if the task actually has pending work.  When
+                # hit_length == 0 the transfer graph is empty and the task was
+                # already marked COMPLETED synchronously inside get_match →
+                # _process_empty_graph, so cancelling would be a no-op that
+                # triggers a spurious "already completed" warning.
+                if hit_length > 0:
+                    self.kv_manager.cancel([flexkv_task_id])
             else:
                 ## GPU hit length is the zero length of token masks
                 gpu_hit_length = torch.logical_not(token_mask).sum()
@@ -587,8 +594,11 @@ class FlexKVConnector(BaseKVConnector):
             self._pending_loads[rid] = flexkv_task_id
         elif update_state_for_load and flexkv_task_id >= 0 and self.tp_rank == 0:
             # Task was not cancelled earlier, but won't be used — cancel it now
-            # to avoid resource leak (e.g. hit_length page-aligned to 0, or rid is None)
-            self.kv_manager.cancel([flexkv_task_id])
+            # to avoid resource leak (e.g. hit_length page-aligned to 0, or rid is None).
+            # Skip cancel when hit_length == 0: the task's transfer graph was
+            # empty and _process_empty_graph already marked it COMPLETED.
+            if hit_length > 0:
+                self.kv_manager.cancel([flexkv_task_id])
         return hit_length
 
     def release_load_state(self, rid: str) -> None:
