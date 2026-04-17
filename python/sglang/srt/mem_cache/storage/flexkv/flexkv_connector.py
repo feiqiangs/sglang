@@ -295,6 +295,29 @@ class FlexKVConnector(BaseKVConnector):
         #       self.src_rank answers "what is the global rank of the group leader" (used as the broadcast source)?
         #       self.global_rank answers "who am I in the world" (global)?
         self.rank = self.cp_rank if cp_size > 1 else self.tp_rank # WARN: Either CP or TP under a DP group, not both
+
+        # ---- Multi-node TP detection ----
+        gpus_per_node = int(os.getenv(
+            "FLEXKV_LOCAL_GPU_COUNT",
+            str(torch.cuda.device_count())
+        ))
+        self.is_multinode_tp = (server_args.tp_size > gpus_per_node)
+        if self.is_multinode_tp:
+            self.node_tp_size = gpus_per_node
+            self.node_tp_rank = self.tp_rank % gpus_per_node
+            self.node_id = self.tp_rank // gpus_per_node
+            logger.info(
+                f"[FlexKV] Multi-node TP detected{self._rank_label}: "
+                f"global_tp_size={server_args.tp_size}, "
+                f"node_tp_size={self.node_tp_size}, "
+                f"node_tp_rank={self.node_tp_rank}, "
+                f"node_id={self.node_id}"
+            )
+        else:
+            self.node_tp_size = server_args.tp_size
+            self.node_tp_rank = self.tp_rank
+            self.node_id = 0
+
         # Compute global_rank and src_rank for correct broadcast in PP scenarios
         self.global_rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
         if cp_size > 1:
@@ -337,6 +360,16 @@ class FlexKVConnector(BaseKVConnector):
             rank_parts.append(f"dp_rank={int(dp_rank)}")
         self._rank_label = f" [{', '.join(rank_parts)}]" if rank_parts else ""
 
+        # ---- Node B: Launch TransferManagerOnRemote ----
+        self._remote_process = None
+        if self.is_multinode_tp and self.node_id > 0 and self.node_tp_rank == 0:
+            from flexkv.transfer_manager import TransferManagerOnRemote
+            self._remote_process = TransferManagerOnRemote.create_process()
+            logger.info(
+                f"[FlexKV] Launched TransferManagerOnRemote on node {self.node_id}"
+                f"{self._rank_label}"
+            )
+
         if self.rank == 0:
             self.kv_manager = KVManager(
                 model_config=self.flexkv_config.model_config,
@@ -351,20 +384,36 @@ class FlexKVConnector(BaseKVConnector):
                 f"server_recv_port={self.flexkv_config.server_recv_port}, "
                 f"gpu_register_port={self.flexkv_config.gpu_register_port}")
 
-        # Use globally unique device_id: dp_rank * {cp|tp}_size + {cp|tp}_rank
-        # so that GPUs from different DP ranks don't collide in TransferManager.
-        # NOTE: This only works for single-node DP. Multi-node DP is not
-        # considered here.
-        if self.cp_size > 1:
-            global_device_id = int(dp_rank) * int(self.cp_size) + int(self.cp_rank) # Either CP or TP
+        # ---- GPU Registration Routing ----
+        if self.is_multinode_tp and self.node_id > 0:
+            # Node B: register to local TransferManagerOnRemote's gpu_register_port
+            local_device_id = int(dp_rank) * self.node_tp_size + self.node_tp_rank
+            self.tp_client = KVTPClient(
+                self.flexkv_config.gpu_register_port, int(dp_rank), local_device_id
+            )
+            logger.info(
+                f"[FlexKV] KVTPClient created (Node B){self._rank_label}: "
+                f"gpu_register_port={self.flexkv_config.gpu_register_port}, "
+                f"local_device_id={local_device_id}")
         else:
-            global_device_id = int(dp_rank) * int(self.tp_size) + int(self.tp_rank)
-        self.tp_client = KVTPClient(self.flexkv_config.gpu_register_port, int(dp_rank), global_device_id) # WARN: Reuse TP client for CP
-        logger.info(
-            (f"[FlexKV] Use KVTPClient on behalf of CP\n" if self.cp_size > 1 else "") +
-            f"[FlexKV] KVTPClient created{self._rank_label}: "
-            f"gpu_register_port={self.flexkv_config.gpu_register_port}")
-        self._register_to_server(kv_caches, indexer_buffers)
+            # Node A (or single-node): register to KVManager's gpu_register_port
+            if self.cp_size > 1:
+                global_device_id = int(dp_rank) * int(self.cp_size) + int(self.cp_rank)
+            else:
+                global_device_id = int(dp_rank) * int(self.tp_size) + int(self.tp_rank)
+            self.tp_client = KVTPClient(
+                self.flexkv_config.gpu_register_port, int(dp_rank), global_device_id
+            )
+            logger.info(
+                (f"[FlexKV] Use KVTPClient on behalf of CP\n" if self.cp_size > 1 else "") +
+                f"[FlexKV] KVTPClient created{self._rank_label}: "
+                f"gpu_register_port={self.flexkv_config.gpu_register_port}")
+
+        # ---- GPU Registration (with retry for Node B) ----
+        if self.is_multinode_tp and self.node_id > 0:
+            self._register_with_retry(kv_caches, indexer_buffers)
+        else:
+            self._register_to_server(kv_caches, indexer_buffers)
         logger.info(
             f"[FlexKV] KVTPClient registered to server{self._rank_label}: "
             f"gpu_register_port={self.flexkv_config.gpu_register_port}")
@@ -385,6 +434,8 @@ class FlexKVConnector(BaseKVConnector):
             sock_suffix += f"_pp{_pp_rank}"
         if _dp_size > 1:
             sock_suffix += f"_dp{_dp_rank}"
+        if self.is_multinode_tp:
+            sock_suffix += f"_node{self.node_id}"
         if sock_suffix:
             root, ext = os.path.splitext(base_eventfd_socket)
             self.layerwise_eventfd_socket = f"{root}{sock_suffix}{ext}"
@@ -456,6 +507,9 @@ class FlexKVConnector(BaseKVConnector):
                     f"(waited {wait_count * 10}s, {diag_str})"
                 )
             logger.info(f"[FlexKV] FlexKV is ready{self._rank_label}")
+        elif self.is_multinode_tp and self.node_id > 0:
+            # Node B: no KVManager to wait for, GPU registration retry handles readiness
+            logger.info(f"[FlexKV] Node B skipping is_ready wait{self._rank_label}")
 
         logger.info(
             f"[FlexKV] Connector initialized{self._rank_label}: "
@@ -746,6 +800,22 @@ class FlexKVConnector(BaseKVConnector):
         if self.rank == 0:
             self.kv_manager.shutdown()
 
+        # Shutdown TransferManagerOnRemote process on Node B
+        if self._remote_process is not None:
+            try:
+                self._remote_process.terminate()
+                self._remote_process.join(timeout=5.0)
+                if self._remote_process.is_alive():
+                    logger.warning(
+                        f"[FlexKV] TransferManagerOnRemote did not terminate gracefully, "
+                        f"killing{self._rank_label}")
+                    self._remote_process.kill()
+                    self._remote_process.join()
+            except Exception as e:
+                logger.warning(
+                    f"[FlexKV] Error shutting down TransferManagerOnRemote{self._rank_label}: {e}")
+            self._remote_process = None
+
     # ---- Private helpers ----
 
     def _wait_flexkv_task(self, fk_task_id: int, timeout: float = 20.0) -> bool:
@@ -760,6 +830,33 @@ class FlexKVConnector(BaseKVConnector):
         except Exception as e:
             logger.error("[FlexKV] wait task failed: %s", e, exc_info=True)
             return False
+
+    def _register_with_retry(
+        self,
+        kv_caches: List[torch.Tensor],
+        indexer_buffers: Optional[List[torch.Tensor]] = None,
+        max_retries: int = 360,
+    ) -> None:
+        """Register GPU with retry for Node B (wait for TransferManagerOnRemote).
+
+        Node B's non-leader ranks may attempt to register before
+        TransferManagerOnRemote has finished initializing. This method
+        retries the registration up to ``max_retries`` times (default 360,
+        i.e. 6 minutes at 1 s intervals).
+        """
+        for attempt in range(max_retries):
+            try:
+                self._register_to_server(kv_caches, indexer_buffers)
+                return
+            except Exception as e:
+                if attempt == max_retries - 1:
+                    raise
+                if attempt % 30 == 0:
+                    logger.info(
+                        f"[FlexKV] GPU register retry{self._rank_label}: "
+                        f"attempt={attempt+1}/{max_retries}, error={e}"
+                    )
+                time.sleep(1.0)
 
     def _register_to_server(
         self,
@@ -918,11 +1015,19 @@ class FlexKVConnector(BaseKVConnector):
                     )
 
                 # Phase 2: Send metadata + eventfds over the connected socket.
+                # For multi-node TP, use node-local tp_rank/tp_size so that
+                # LayerwiseWorker builds the correct eventfd tensor shape.
                 num_counters = self._layer_done_counter.num_counters
+                if self.is_multinode_tp:
+                    local_tp_rank = self.node_tp_rank
+                    local_tp_size = self.node_tp_size
+                else:
+                    local_tp_rank = self.tp_rank
+                    local_tp_size = self.tp_size
                 metadata = struct.pack(
                     "iiiiii",
-                    self.tp_rank,
-                    self.tp_size,
+                    local_tp_rank,
+                    local_tp_size,
                     self.cp_rank,
                     self.cp_size,
                     self.num_layers,
@@ -931,7 +1036,7 @@ class FlexKVConnector(BaseKVConnector):
                 sock.sendall(metadata)
                 logger.debug(
                     f"[FlexKV] Eventfd metadata sent{self._rank_label}: "
-                    f"tp_rank={self.tp_rank}, tp_size={self.tp_size}, "
+                    f"tp_rank={local_tp_rank}, tp_size={local_tp_size}, "
                     f"cp_rank={self.cp_rank}, cp_size={self.cp_size}, "
                     f"num_layers={self.num_layers}, num_counters={num_counters}"
                 )
