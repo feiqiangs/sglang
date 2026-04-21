@@ -815,12 +815,19 @@ class FlexKVConnector(BaseKVConnector):
             token_ids_np = np.array(token_ids, dtype=np.int64)
             prefetch_task_id = self.kv_manager.prefetch_async(token_ids=token_ids_np)
 
-        if self.tp_cpu_group is not None and self.tp_size > 1:
+        if self.cp_cpu_group is not None and self.cp_size > 1:
             prefetch_task_id = broadcast_pyobj(
                 [{"task_id": prefetch_task_id}],
-                self.rank,
+                self.global_rank,
+                self.cp_cpu_group,
+                src=self.src_rank,
+            )[0]["task_id"]
+        elif self.tp_cpu_group is not None and self.tp_size > 1:
+            prefetch_task_id = broadcast_pyobj(
+                [{"task_id": prefetch_task_id}],
+                self.global_rank,
                 self.tp_cpu_group,
-                src=0,
+                src=self.src_rank,
             )[0]["task_id"]
 
         if prefetch_task_id >= 0:
@@ -848,12 +855,20 @@ class FlexKVConnector(BaseKVConnector):
                     )
                 is_completed = True
 
-        if self.tp_cpu_group is not None and self.tp_size > 1:
+        if self.cp_cpu_group is not None and self.cp_size > 1:
             data = broadcast_pyobj(
                 [{"is_completed": is_completed}],
-                self.rank,
+                self.global_rank,
+                self.cp_cpu_group,
+                src=self.src_rank,
+            )[0]
+            is_completed = data["is_completed"]
+        elif self.tp_cpu_group is not None and self.tp_size > 1:
+            data = broadcast_pyobj(
+                [{"is_completed": is_completed}],
+                self.global_rank,
                 self.tp_cpu_group,
-                src=0,
+                src=self.src_rank,
             )[0]
             is_completed = data["is_completed"]
 
