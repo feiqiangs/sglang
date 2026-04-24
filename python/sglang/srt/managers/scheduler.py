@@ -805,18 +805,14 @@ class Scheduler(
                         f"Connector class {class_name} must inherit from "
                         "sglang.srt.mem_cache.kv_connector.BaseKVConnector"
                     )
-                # Attach DP/PP dimensions so the connector can discover them
-                server_args._dp_size = getattr(self, "dp_size", 1)
-                server_args._dp_rank = getattr(self, "dp_rank", 0)
-                server_args._pp_rank = getattr(self, "pp_rank", 0)
                 connector = connector_cls(
                     params=params,
                     server_args=server_args,
-                    tp_group=self.tp_group,
                     tp_rank=self.tp_rank,
-                    cp_group=self.attn_cp_group,
+                    tp_group=self.tp_group,
                     cp_rank=self.attn_cp_rank,
-                    kvcache=params.token_to_kv_pool_allocator.get_kvcache(),
+                    cp_group=self.attn_cp_group,
+                    dp_rank=self.dp_rank,
                 )
                 self.tree_cache = ExtendedRadixCache(params=params, connector=connector)
 

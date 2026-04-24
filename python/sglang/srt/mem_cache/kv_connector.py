@@ -1,9 +1,13 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from typing import Any, List, NamedTuple, Optional
+from typing import TYPE_CHECKING, Any, List, NamedTuple, Optional
 
 import torch
+
+if TYPE_CHECKING:
+    from sglang.srt.mem_cache.cache_init_params import CacheInitParams
+    from sglang.srt.server_args import ServerArgs
 
 
 class LoadOperation(NamedTuple):
@@ -15,20 +19,21 @@ class LoadOperation(NamedTuple):
 class BaseKVConnector(ABC):
     def __init__(
         self,
-        params: Any = None,
-        server_args: Any = None,
-        tp_group: Any = None,
+        params: "CacheInitParams",
+        server_args: "ServerArgs",
         tp_rank: int = 0,
-        cp_group: Any = None,
+        tp_group: Optional[torch.distributed.ProcessGroup] = None,
         cp_rank: int = 0,
-        kvcache: Any = None,
+        cp_group: Optional[torch.distributed.ProcessGroup] = None,
+        dp_rank: Optional[int] = 0,
     ):
         self.params = params
         self.server_args = server_args
-        self.tp_group = tp_group
         self.tp_rank = tp_rank
+        self.tp_group = tp_group
         self.cp_rank = cp_rank
-        self.kvcache = kvcache
+        self.cp_group = cp_group
+        self.dp_rank: int = dp_rank if dp_rank is not None else 0
 
     @abstractmethod
     def get_new_hit_length(
