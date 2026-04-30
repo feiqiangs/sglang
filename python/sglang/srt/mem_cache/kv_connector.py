@@ -22,18 +22,20 @@ class BaseKVConnector(ABC):
         params: "CacheInitParams",
         server_args: "ServerArgs",
         tp_rank: int = 0,
-        tp_group: Optional[torch.distributed.ProcessGroup] = None,
-        cp_rank: int = 0,
-        cp_group: Optional[torch.distributed.ProcessGroup] = None,
         dp_rank: Optional[int] = 0,
+        attn_cp_rank: Optional[int] = 0,
+        pp_group: Optional[torch.distributed.ProcessGroup] = None,
+        attn_tp_group: Optional[torch.distributed.ProcessGroup] = None,
+        attn_cp_group: Optional[torch.distributed.ProcessGroup] = None,
     ):
         self.params = params
         self.server_args = server_args
         self.tp_rank = tp_rank
-        self.tp_group = tp_group
-        self.cp_rank = cp_rank
-        self.cp_group = cp_group
-        self.dp_rank: int = dp_rank if dp_rank is not None else 0
+        self.dp_rank = dp_rank
+        self.attn_cp_rank = attn_cp_rank
+        self.pp_group = pp_group
+        self.attn_tp_group = attn_tp_group
+        self.attn_cp_group = attn_cp_group
 
     @abstractmethod
     def get_new_hit_length(

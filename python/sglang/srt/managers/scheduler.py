@@ -809,10 +809,11 @@ class Scheduler(
                     params=params,
                     server_args=server_args,
                     tp_rank=self.tp_rank,
-                    tp_group=self.tp_group,
-                    cp_rank=self.attn_cp_rank,
-                    cp_group=self.attn_cp_group,
                     dp_rank=self.dp_rank,
+                    attn_cp_rank=self.attn_cp_rank,
+                    pp_group=self.pp_group,
+                    attn_tp_group=self.attn_tp_group,
+                    attn_cp_group=self.attn_cp_group,
                 )
                 self.tree_cache = ExtendedRadixCache(params=params, connector=connector)
 
