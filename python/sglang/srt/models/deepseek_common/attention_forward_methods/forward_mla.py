@@ -519,6 +519,11 @@ class DeepseekMLAForwardMixin:
         Check if we should skip rope and do fused rope+quantize for TRTLLM MLA decode in fp8_e4m3 path.
         """
         if self.current_attention_backend == "nsa":
+            # Disable fused rope when CP is active: rebuild_cp_kv_cache all-gathers
+            # k_pe across CP ranks (all_tokens), but forward_batch.positions only has
+            # local_tokens, causing shape mismatch in mla_quantize_and_rope_for_fp8.
+            if nsa_use_prefill_cp(forward_batch):
+                return False
             return (
                 get_global_server_args().nsa_decode_backend == "trtllm"
                 or get_global_server_args().nsa_prefill_backend == "trtllm"

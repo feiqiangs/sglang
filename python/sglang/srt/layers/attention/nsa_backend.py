@@ -1959,21 +1959,25 @@ class NativeSparseAttnBackend(
             # Note: rope application in deepseek_v2.py:forward_absorb_prepare is skipped for FP8 decode path of this trtllm_mla backend
             assert q_rope is not None, "For FP8 path q_rope should not be None."
             assert k_rope is not None, "For FP8 path k_rope should not be None."
-            assert (
-                cos_sin_cache is not None
-            ), "For FP8 path cos_sin_cache should not be None."
 
-            q, k, k_rope = mla_quantize_and_rope_for_fp8(
-                q,
-                q_rope,
-                k.squeeze(1),
-                k_rope.squeeze(1),
-                forward_batch.positions,
-                cos_sin_cache,
-                is_neox,
-                self.kv_lora_rank,
-                self.qk_rope_head_dim,
-            )
+            if cos_sin_cache is not None:
+                q, k, k_rope = mla_quantize_and_rope_for_fp8(
+                    q,
+                    q_rope,
+                    k.squeeze(1),
+                    k_rope.squeeze(1),
+                    forward_batch.positions,
+                    cos_sin_cache,
+                    is_neox,
+                    self.kv_lora_rank,
+                    self.qk_rope_head_dim,
+                )
+            else:
+                # CP mode: RoPE already applied before all-gather, only quantize.
+                attn_dtype = torch.float8_e4m3fn
+                q = torch.cat([q, q_rope], dim=-1).to(attn_dtype)
+                k = k.squeeze(1).to(attn_dtype)
+                k_rope = k_rope.squeeze(1).to(attn_dtype)
             merge_query = False
 
             # Save KV cache if requested
