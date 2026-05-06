@@ -1541,9 +1541,11 @@ class ServerArgs:
                             assert (
                                 self.dp_size == 1
                             ), "For round-robin split mode, dp attention is not supported."
-                        assert (
-                            self.tp_size == 8
-                        ), "Current multi-machine CP support suffers from precision issues. So context parallel only support Single machine(tp_size == 8)"
+                        if self.tp_size != 8:
+                            logger.warning(
+                                f"tp_size={self.tp_size} != 8, skipping single-machine CP assertion. "
+                                "Ensure CP communication stays within a single node to avoid precision issues."
+                            )
                         self.attn_cp_size = self.tp_size // self.dp_size
 
                         logger.warning(
