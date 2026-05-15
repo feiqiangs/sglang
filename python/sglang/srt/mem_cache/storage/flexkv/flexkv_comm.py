@@ -89,7 +89,17 @@ class FlexKVComm:
         self.pp_rank = flexkv_model_config.pp_rank
         self.attn_tp_rank = flexkv_model_config.attn_tp_rank
         self.attn_cp_rank = flexkv_model_config.attn_cp_rank
-        self.is_nsa_cp = flexkv_model_config.is_nsa_cp
+        # NOTE: ``is_nsa_cp`` was renamed to ``is_nsa`` per the dist_reuse
+        # simplified design — see
+        # ``FlexKV/docs/dist_reuse/dist_reuse_with_cp_pp_multinode_tp_simplified.md`` §3.4.
+        # The flag now expresses "this model is an NSA model" (layout dimension)
+        # rather than anything CP-specific.  We keep the legacy ``is_nsa_cp``
+        # attribute name on this comm object for backwards-compatibility with
+        # existing call sites in flexkv_connector.
+        self.is_nsa_cp = getattr(
+            flexkv_model_config, "is_nsa",
+            getattr(flexkv_model_config, "is_nsa_cp", False),
+        )
 
         # ---- Role resolution ----
         self.is_pp_stage_leader = (self.attn_tp_rank == 0 and self.attn_cp_rank == 0)

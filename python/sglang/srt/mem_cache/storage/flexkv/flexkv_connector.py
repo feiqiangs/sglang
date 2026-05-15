@@ -25,6 +25,11 @@ try:
     from flexkv.common.request import KVResponseStatus
     from flexkv.common.storage import KVCacheLayout, KVCacheLayoutType
     from flexkv.integration.config import FlexKVConfig
+    from flexkv.integration.multinode_policy import (
+        RankTopology,
+        RemoteProcessRole,
+        decide_remote_role,
+    )
     from flexkv.kvmanager import KVManager
     from flexkv.server.client import KVTPClient
     from flexkv.transfer.layerwise import build_layerwise_eventfd_socket_path
@@ -162,6 +167,22 @@ class FlexKVConnector(BaseKVConnector):
                 )
             setattr(self.flexkv_config.cache_config, _attr, _aligned)
 
+        # ---- Multinode role decision (§2.4) ----
+        # ``decide_remote_role`` replaces the old
+        # ``nnodes > 1 and node_rank > 0 and local_rank == 0``
+        # heuristic.  It separates TP-cross-node (SD_REMOTE_FULL) from
+        # CP-cross-node (CP_PEER_REGISTRATION_ONLY) and leaves
+        # single-node deployments byte-identical to pre-§2.4.
+        self._rank_topology = RankTopology(
+            nnodes=flexkv_model_config.nnodes,
+            node_rank=flexkv_model_config.node_rank,
+            local_rank=flexkv_model_config.local_rank,
+            is_multinode_tp=flexkv_model_config.is_multinode_tp,
+            is_multinode_cp=flexkv_model_config.is_multinode_cp,
+            is_sync_leader=self._sync_ctx.is_sync_leader,
+        )
+        self._remote_role = decide_remote_role(self._rank_topology)
+
         if flexkv_model_config.nnodes > 1:
             logger.info(
                 f"[FlexKV] Multi-node detected{self._rank_label}: "
@@ -170,7 +191,10 @@ class FlexKVConnector(BaseKVConnector):
                 f"attn_tp_size={flexkv_model_config.attn_tp_size}, "
                 f"attn_cp_size={flexkv_model_config.attn_cp_size}, "
                 f"dp_size={flexkv_model_config.dp_size}, pp_size={flexkv_model_config.pp_size}, "
-                f"nnodes={flexkv_model_config.nnodes}"
+                f"nnodes={flexkv_model_config.nnodes}, "
+                f"is_multinode_tp={flexkv_model_config.is_multinode_tp}, "
+                f"is_multinode_cp={flexkv_model_config.is_multinode_cp}, "
+                f"remote_role={self._remote_role.name}"
             )
 
         # Build unified kv_caches list (MLA vs MHA)
@@ -194,18 +218,47 @@ class FlexKVConnector(BaseKVConnector):
                 f"expected 'kv_buffer' (MLA/NSA) or 'k_buffer'/'v_buffer' (MHA)."
             )
 
-        # ---- Node B: Launch TransferManagerOnRemote ----
+        # ---- Launch TransferManagerOnRemote (§2.4 role-based) ----
         self._remote_process = None
-        if flexkv_model_config.nnodes > 1 and flexkv_model_config.node_rank > 0 and flexkv_model_config.local_rank == 0:
+        if self._remote_role is RemoteProcessRole.SD_REMOTE_FULL:
+            # PP-Remote / TP-Remote: full TransferManagerOnRemote with
+            # RedisMeta + Mooncake registration on the peer SD.
             logger.debug(
-                f"[FlexKV] Launching TransferManagerOnRemote{self._rank_label}: "
+                f"[FlexKV] Launching TransferManagerOnRemote (SD_REMOTE_FULL)"
+                f"{self._rank_label}: "
                 f"master_host={self.flexkv_config.model_config.master_host}")
             self._remote_process = TransferManagerOnRemote.create_process(
                 master_host=self.flexkv_config.model_config.master_host,
             )
             logger.info(
-                f"[FlexKV] Launched TransferManagerOnRemote on node_rank={flexkv_model_config.node_rank}"
-                f"{self._rank_label}"
+                f"[FlexKV] Launched TransferManagerOnRemote (SD_REMOTE_FULL) on "
+                f"node_rank={flexkv_model_config.node_rank}{self._rank_label}"
+            )
+        elif self._remote_role is RemoteProcessRole.CP_PEER_REGISTRATION_ONLY:
+            # CP-rank > 0 node: needs local GPU registered to FlexKV
+            # transfer layer for H2D, but does NOT need RedisMeta /
+            # Mooncake registration (the sync_leader's CPU pool
+            # represents the entire CP group in the SD).
+            #
+            # TODO(§2.4 Phase 1-G): spawn a lightweight
+            # TransferManagerOnRemote variant that only does
+            # KVTPClient GPU registration + receives coordinated H2D
+            # instructions.  For now, fall through to the same
+            # ``TransferManagerOnRemote.create_process`` — the Remote
+            # bootstrap will set ``d2h_and_publish=None`` which is
+            # exactly the lightweight behaviour we want; it just also
+            # registers to Redis/Mooncake (unnecessary overhead, but
+            # functionally harmless).
+            logger.info(
+                f"[FlexKV] Launching TransferManagerOnRemote "
+                f"(CP_PEER_REGISTRATION_ONLY){self._rank_label}: "
+                f"master_host={self.flexkv_config.model_config.master_host}")
+            self._remote_process = TransferManagerOnRemote.create_process(
+                master_host=self.flexkv_config.model_config.master_host,
+            )
+            logger.info(
+                f"[FlexKV] Launched TransferManagerOnRemote (CP_PEER) on "
+                f"node_rank={flexkv_model_config.node_rank}{self._rank_label}"
             )
 
         if self._sync_ctx.is_sync_leader:
@@ -321,9 +374,15 @@ class FlexKVConnector(BaseKVConnector):
                     f"(waited {wait_count * 10}s, {diag_str})"
                 )
             logger.info(f"[FlexKV] FlexKV is ready{self._rank_label}")
-        elif flexkv_model_config.nnodes > 1 and flexkv_model_config.node_rank > 0:
-            # Node B: no KVManager to wait for, GPU registration retry handles readiness
-            logger.info(f"[FlexKV] Node B skipping is_ready wait{self._rank_label}")
+        elif self._remote_role in (
+            RemoteProcessRole.SD_REMOTE_FULL,
+            RemoteProcessRole.CP_PEER_REGISTRATION_ONLY,
+        ):
+            # Remote nodes: no KVManager to wait for, GPU registration retry handles readiness
+            logger.info(
+                f"[FlexKV] Remote node ({self._remote_role.name}) skipping "
+                f"is_ready wait{self._rank_label}"
+            )
 
         logger.info(
             f"[FlexKV] Connector initialized{self._rank_label}: "
