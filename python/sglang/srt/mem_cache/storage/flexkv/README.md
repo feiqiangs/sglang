@@ -136,6 +136,31 @@ Waiters never borrow unfinished GPU slots. MP and hybrid caches do not use this
 optimization. `FLEXKV_DEDUP_INDEXER_GROUP` is a separate FlexKV connector/layout
 option; when changing layouts, use an empty or separately namespaced cache pool.
 
+## Indexer pruning, CP layer split and early P->D drain
+
+These hooks live in `flexkv_extensions.py` and are wired only into the ordinary
+`FlexKVRadixCache`; the hybrid adapter does not use them yet.
+
+- **Indexer pruning.** The cache passes the pool's active Indexer layers (those
+  whose `skip_topk_layers` entry is `False`) to the connector as
+  `indexer_layer_ids`. Pruning itself is controlled by FlexKV's
+  `FLEXKV_DEDUP_INDEXER_GROUP` (default off); the connector rejects IDs that
+  disagree with `skip_topk_layers`. Only models with shared top-k layers
+  (`indexer_types`, `cli_factor`, `index_topk_pattern` or `index_topk_freq`)
+  have anything to prune. Changing this layout needs an empty or separately
+  namespaced cache pool.
+- **CP layer split.** No SGLang-side option: with
+  `--enable-dsa-cache-layer-split` the connector derives each layer's holder
+  from the physical `LayerSplitDSATokenToKVPool`. It needs a FlexKV build whose
+  native extension exposes `RegionRequest.h2d_rank`.
+- **Early P->D drain.** `FLEXKV_EARLY_DISAGG_DRAIN` (default on) retires
+  finished P->D transfers at the start of `check_hicache_events` and again
+  right after `policy.calc_priority`, so their GPU pages are free before
+  prefill admission. It is active only on PD prefill workers with
+  `pp_size == 1`; otherwise it disables itself and logs the reason. The second
+  drain point is skipped while a parked (`pending_bootstrap`) request is in
+  the transfer queue. Set it to `0` to restore the stock behavior.
+
 ## Supported boundaries
 
 - Speculative modes using EAGLE-style bigram radix keys (currently EAGLE,

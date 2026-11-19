@@ -57,6 +57,10 @@ from sglang.srt.mem_cache.storage.flexkv.flexkv_cache_lifecycle import (
     _namespace_kwargs,
     _request_key,
 )
+from sglang.srt.mem_cache.storage.flexkv.flexkv_extensions import (
+    EarlyDisaggDrain,
+    active_indexer_layer_ids,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
@@ -143,7 +147,13 @@ class FlexKVRadixCache(FlexKVCacheLifecycleMixin, RadixCache):
             pp_group=pp_group,
             attn_tp_group=attn_tp_group_eff,
             attn_cp_group=attn_cp_group,
+            # CP layer split: the connector derives layer holders from the
+            # physical LayerSplitDSATokenToKVPool. Indexer pruning:
+            # FLEXKV_DEDUP_INDEXER_GROUP (default off) decides whether these
+            # active layers are used.
+            indexer_layer_ids=active_indexer_layer_ids(kvcache),
         )
+        self._early_drain = EarlyDisaggDrain(self)
 
         self._mode = (
             FlexKVMode.IP if self.flexkv_connector.enable_layerwise else FlexKVMode.MP
@@ -905,7 +915,11 @@ class FlexKVRadixCache(FlexKVCacheLifecycleMixin, RadixCache):
 
         Drains both store completions (so source nodes get unlocked
         quickly) and the launched-load tail (so the FlexKV pipe
-        doesn't accumulate)."""
+        doesn't accumulate). On PD prefill workers it first retires finished
+        P->D transfers, so their pages are free for this admission."""
+        early_drain = getattr(self, "_early_drain", None)
+        if early_drain is not None:
+            early_drain.on_scheduler_tick()
         self._drain_completed_stores()
         self.flexkv_connector.drain_launched_loads()
         self._launch_pending_stores()
